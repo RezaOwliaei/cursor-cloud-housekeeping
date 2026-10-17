@@ -107,17 +107,17 @@ ENV_REMAINING=$(curl -sS "${CURSOR_API_BASE_URL}/v1/environments" | jq '.items |
 echo "PASS [6/15]: Full housekeeping (--all --verbose) cleaned up all chats, history, and environments."
 echo ""
 
-echo "--- TEST 7: delete_all_agents.sh --verbous ---"
+echo "--- TEST 7: housekeeping.sh --all-agents --verbous ---"
 reset_mock
-./delete_all_agents.sh --verbous
+./housekeeping.sh --all-agents --verbous
 REMAINING=$(curl -sS "${CURSOR_API_BASE_URL}/v1/agents" | jq '.items | length')
 [[ "$REMAINING" -eq 0 ]] || { echo "Assertion failed: expected 0 agents left, got $REMAINING"; exit 1; }
-echo "PASS [7/15]: delete_all_agents.sh --verbous listed and deleted all 3 agents."
+echo "PASS [7/15]: housekeeping.sh --all-agents --verbous listed and deleted all 3 agents."
 echo ""
 
-echo "================================================================================"
-echo "PART B: ERROR HANDLING & DIAGNOSTIC HINT TESTS (Tests 8 - 15)"
-echo "================================================================================"
+================================================================================
+PART B: ERROR HANDLING & DIAGNOSTIC HINT TESTS (Tests 8 - 15)
+================================================================================
 
 echo "--- TEST 8: Missing CURSOR_API_KEY ---"
 CURSOR_API_KEY="" assert_fails_with "Environment variable CURSOR_API_KEY is missing or empty." ./housekeeping.sh --all
@@ -130,7 +130,7 @@ echo "PASS [9/15]: Missing target switches produces readable error and hint."
 echo ""
 
 echo "--- TEST 10: Unknown CLI option ---"
-assert_fails_with "Unknown option or switch '--not-a-valid-flag'" ./delete_all_agents.sh --not-a-valid-flag
+assert_fails_with "Unknown option or switch '--not-a-valid-flag'" ./housekeeping.sh --not-a-valid-flag
 echo "PASS [10/15]: Unknown CLI flag produces readable error and supported options hint."
 echo ""
 
@@ -140,7 +140,7 @@ echo "PASS [11/15]: HTTP 401 Unauthorized is caught with dashboard API Key hint.
 echo ""
 
 echo "--- TEST 12: HTTP 429 Rate Limit Exceeded ---"
-CURSOR_API_KEY="rate_limited_key" assert_fails_with "HTTP 429 (Too Many Requests): API rate limit of 60 requests/min exceeded" ./delete_all_agents.sh
+CURSOR_API_KEY="rate_limited_key" assert_fails_with "HTTP 429 (Too Many Requests): API rate limit of 60 requests/min exceeded" ./housekeeping.sh --all-agents
 echo "PASS [12/15]: HTTP 429 Too Many Requests is caught with backoff hint."
 echo ""
 
@@ -150,17 +150,17 @@ echo "PASS [13/15]: HTTP 503 Server Error is caught with temporary outage hint."
 echo ""
 
 echo "--- TEST 14: Malformed Non-JSON Response (HTML Proxy / Bad Gateway) ---"
-CURSOR_API_KEY="bad_json_key" assert_fails_with "returned an invalid (non-JSON) response" ./delete_all_agents.sh
+CURSOR_API_KEY="bad_json_key" assert_fails_with "returned an invalid (non-JSON) response" ./housekeeping.sh --all-agents
 echo "PASS [14/15]: Non-JSON HTML response is caught cleanly before jq parsing."
 echo ""
 
 echo "--- TEST 15: Partial Deletion Failure (HTTP 403 Forbidden) & Unreachable Host (curl exit 7) ---"
 reset_mock
 CURSOR_API_KEY="partial_delete_fail_key" assert_fails_with "HTTP 403 (Forbidden): Team admin role required" ./housekeeping.sh --all
-CURSOR_API_BASE_URL="http://127.0.0.1:19999" assert_fails_with "Failed to connect to 'http://127.0.0.1:19999/v1/agents?limit=100&includeArchived=true' (curl exit 7" ./delete_all_agents.sh
+CURSOR_API_BASE_URL="http://127.0.0.1:19999" assert_fails_with "Failed to connect to 'http://127.0.0.1:19999/v1/agents?limit=100&includeArchived=true' (curl exit 7" ./housekeeping.sh --all-agents
 echo "PASS [15/15]: Partial HTTP 403 deletion failure and curl exit 7 connection refused handled with clear diagnostics."
 echo ""
 
-echo "================================================================================"
-echo "ALL 15/15 DOCKER CONTAINER TESTS PASSED (7 Functional + 8 Error Handling)!"
-echo "================================================================================"
+================================================================================
+ALL 15/15 DOCKER CONTAINER TESTS PASSED (7 Functional + 8 Error Handling)!
+================================================================================

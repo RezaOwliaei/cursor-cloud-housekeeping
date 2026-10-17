@@ -13,8 +13,6 @@ A unified command-line utility for auditing, exporting, and cleaning up **Cursor
   - History purge & backup: Purge run & conversation history (`--chat-history`) with optional local JSON export (`--export-history`).
   - Environment cleanup: Delete saved Cloud Agent environments & their change history (`--environments`).
   - One-shot wipe: Clean up everything in one command (`--all`).
-- **Backward-Compatible Alias (`delete_all_agents.sh`)**:
-  - `delete_all_agents.sh` is fully consolidated into `housekeeping.sh` and serves as a backward-compatible wrapper forwarding to `./housekeeping.sh --all-agents "$@"`.
 - **Readable Error Handling & Hints**:
   - Clear explanations for missing keys, network/TLS errors, rate limits (HTTP 429), permissions (HTTP 403), and server issues (HTTP 5xx), complete with actionable troubleshooting hints (`-> Hint:`).
 - **Tested & Verified**:
@@ -47,7 +45,7 @@ sudo apt-get update && sudo apt-get install -y curl jq
 ```bash
 git clone https://github.com/RezaOwliaei/cursor-cloud-housekeeping.git
 cd cursor-cloud-housekeeping
-chmod +x housekeeping.sh delete_all_agents.sh
+chmod +x housekeeping.sh
 ```
 
 ### 2. Configure Your API Key
@@ -102,7 +100,6 @@ export CURSOR_API_KEY="your_api_key_here"
 # Delete all agents with detailed verbose metadata
 ./housekeeping.sh --all-agents --verbose
 ```
-*(Note: Running `./delete_all_agents.sh` also forwards directly to `./housekeeping.sh --all-agents`)*
 
 ### 2. Delete Only Archived Agents
 ```bash
