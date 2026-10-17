@@ -14,6 +14,7 @@ set -euo pipefail
 
 BASE_URL="${CURSOR_API_BASE_URL:-https://api.cursor.com}"
 API_KEY="${CURSOR_API_KEY:-}"
+CURL_TIMEOUT="${CURSOR_API_TIMEOUT:-30}"
 
 CLEAN_ARCHIVED_CHATS=false
 CLEAN_ACTIVE_CHATS=false
@@ -25,7 +26,10 @@ VERBOSE=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
-mkdir -p "$LOG_DIR"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [[ ! -w "$LOG_DIR" ]]; then
+  echo "ERROR: Cannot create or write to log directory '${LOG_DIR}'. Check folder permissions." >&2
+  exit 1
+fi
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/housekeeping_${TIMESTAMP}.log}"
 
@@ -46,24 +50,136 @@ Options:
   -v, --verbose, --verbous       Show detailed metadata, run/chat history, and deletion progress
   -n, --dry-run                  Preview items to be cleaned up without deleting anything
   -h, --help                     Show this help message
-
-Examples:
-  # Delete only archived chats (dry-run preview):
-  ./housekeeping.sh --archived-chats --dry-run
-
-  # Delete active chats and saved environments with verbose logs:
-  ./housekeeping.sh --active-chats --environments --verbose
-
-  # Clean up chat history (with local backup) and all environments:
-  ./housekeeping.sh --chat-history --export-history --environments
-
-  # Full housekeeping (all chats, chat history, and environments):
-  ./housekeeping.sh --all --verbose
 EOF
 }
 
+log() {
+  printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$LOG_FILE"
+}
+
+log_err() {
+  printf "[%s] ERROR: %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$LOG_FILE" >&2
+}
+
+log_hint() {
+  printf "[%s]   -> Hint: %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$LOG_FILE" >&2
+}
+
+vlog() {
+  if [[ "$VERBOSE" == "true" ]]; then
+    printf "[%s] [VERBOSE] %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$LOG_FILE"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# Readable Error Formatting Helpers
+# ------------------------------------------------------------------------------
+explain_curl_error() {
+  local code="$1"
+  local url="$2"
+  case "$code" in
+    6)
+      log_err "Could not resolve host for '${url}' (curl exit 6)."
+      log_hint "Check your internet connection or verify CURSOR_API_BASE_URL (${BASE_URL})."
+      ;;
+    7)
+      log_err "Failed to connect to '${url}' (curl exit 7: connection refused/unreachable)."
+      log_hint "Ensure the API server at ${BASE_URL} is reachable and not blocked by a firewall."
+      ;;
+    28)
+      log_err "Request to '${url}' timed out after ${CURL_TIMEOUT}s (curl exit 28)."
+      log_hint "Check network latency or increase CURSOR_API_TIMEOUT."
+      ;;
+    35|60)
+      log_err "TLS/SSL handshake failed when connecting to '${url}' (curl exit ${code})."
+      log_hint "Verify system CA certificates and system clock, or check proxy/VPN settings."
+      ;;
+    *)
+      log_err "Network request to '${url}' failed (curl exit ${code})."
+      log_hint "Verify network connectivity and CURSOR_API_BASE_URL (${BASE_URL})."
+      ;;
+  esac
+}
+
+extract_api_error_detail() {
+  local body_file="$1"
+  if [[ ! -s "$body_file" ]]; then
+    echo "empty response body"
+    return
+  fi
+  if jq -e . "$body_file" >/dev/null 2>&1; then
+    local detail
+    detail=$(jq -r '(.message // .error.message // .error // .code // empty)' "$body_file" 2>/dev/null || true)
+    if [[ -n "$detail" && "$detail" != "null" ]]; then
+      echo "$detail"
+      return
+    fi
+  fi
+  head -c 200 "$body_file" | tr '\n' ' '
+}
+
+explain_http_error() {
+  local status="$1"
+  local context="$2"
+  local body_file="$3"
+  local detail
+  detail="$(extract_api_error_detail "$body_file")"
+
+  case "$status" in
+    400)
+      log_err "${context} failed with HTTP 400 (Bad Request): ${detail}"
+      log_hint "Check request parameters or pagination cursor format."
+      ;;
+    401)
+      log_err "${context} failed with HTTP 401 (Unauthorized): ${detail}"
+      log_hint "Your CURSOR_API_KEY is invalid, expired, or revoked. Generate a valid key at https://cursor.com/dashboard (API Keys)."
+      ;;
+    403)
+      log_err "${context} failed with HTTP 403 (Forbidden): ${detail}"
+      log_hint "Your API key does not have permission to modify this resource (e.g. team admin rights required)."
+      ;;
+    404)
+      log_err "${context} failed with HTTP 404 (Not Found): ${detail}"
+      log_hint "The resource may have already been deleted, or the ID/endpoint URL is invalid."
+      ;;
+    409)
+      log_err "${context} failed with HTTP 409 (Conflict): ${detail}"
+      log_hint "The resource has a conflicting state (e.g. an active run is busy or already terminated)."
+      ;;
+    429)
+      log_err "${context} failed with HTTP 429 (Too Many Requests): ${detail}"
+      log_hint "Cursor API rate limit reached. Wait 30-60 seconds before re-running the script."
+      ;;
+    500|502|503|504)
+      log_err "${context} failed with HTTP ${status} (Cursor Server Error): ${detail}"
+      log_hint "Cursor Cloud API is experiencing a temporary outage. Retry shortly."
+      ;;
+    *)
+      log_err "${context} failed with HTTP ${status}: ${detail}"
+      log_hint "Inspect the log file (${LOG_FILE#$SCRIPT_DIR/}) or run with --verbose for details."
+      ;;
+  esac
+}
+
+validate_json_file() {
+  local file="$1"
+  local context="$2"
+  if [[ ! -s "$file" ]] || ! jq -e . "$file" >/dev/null 2>&1; then
+    local snippet
+    snippet=$(head -c 200 "$file" 2>/dev/null | tr '\n' ' ' || true)
+    log_err "${context} returned an invalid (non-JSON) response: ${snippet:-<empty>}"
+    log_hint "Verify CURSOR_API_BASE_URL (${BASE_URL}) points to the Cursor API and not an HTML proxy/login page."
+    return 1
+  fi
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# Argument Parsing & Pre-flight Validation
+# ------------------------------------------------------------------------------
 if [[ $# -eq 0 ]]; then
-  usage
+  log_err "No target switches provided."
+  log_hint "Pass at least one target switch: --archived-chats, --active-chats, --all-chats, --chat-history, --environments, or --all (use --help for usage)."
   exit 1
 fi
 
@@ -85,7 +201,8 @@ for arg in "$@"; do
     --dry-run|-n)                DRY_RUN=true ;;
     --help|-h)                   usage; exit 0 ;;
     *)
-      echo "Unknown argument: $arg (use --help)" >&2
+      log_err "Unknown option or switch '${arg}'."
+      log_hint "Valid switches: --archived-chats, --active-chats, --all-chats, --chat-history, --environments, --all, --export-history, --verbose, --dry-run."
       exit 1
       ;;
   esac
@@ -99,27 +216,22 @@ if [[ "$CLEAN_CHAT_HISTORY" == "true" && "$CLEAN_ARCHIVED_CHATS" == "false" && "
 fi
 
 if [[ "$CLEAN_ARCHIVED_CHATS" == "false" && "$CLEAN_ACTIVE_CHATS" == "false" && "$CLEAN_ENVIRONMENTS" == "false" && "$CLEAN_CHAT_HISTORY" == "false" ]]; then
-  echo "Error: Specify at least one target switch (e.g. --archived-chats, --active-chats, --chat-history, --environments, or --all)." >&2
-  usage
+  log_err "No cleanup target selected."
+  log_hint "Specify at least one target switch: --archived-chats, --active-chats, --all-chats, --chat-history, --environments, or --all."
   exit 1
 fi
 
-log() {
-  printf "[%s] %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$LOG_FILE"
-}
-
-vlog() {
-  if [[ "$VERBOSE" == "true" ]]; then
-    printf "[%s] [VERBOSE] %s\n" "$(date +%H:%M:%S)" "$*" | tee -a "$LOG_FILE"
-  fi
-}
-
 for cmd in curl jq; do
-  command -v "$cmd" >/dev/null 2>&1 || { log "ERROR: '$cmd' is required."; exit 1; }
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    log_err "Required CLI tool '${cmd}' is not installed or not in PATH."
+    log_hint "Install it via Homebrew ('brew install ${cmd}') or apt ('sudo apt-get install -y ${cmd}')."
+    exit 1
+  fi
 done
 
-if [[ -z "$API_KEY" ]]; then
-  log "ERROR: CURSOR_API_KEY is not set."
+if [[ -z "${API_KEY// /}" ]]; then
+  log_err "Environment variable CURSOR_API_KEY is missing or empty."
+  log_hint "Create an API key at https://cursor.com/dashboard -> API Keys, then run: export CURSOR_API_KEY='your_key'"
   exit 1
 fi
 
@@ -152,15 +264,23 @@ if [[ "$CLEAN_ARCHIVED_CHATS" == "true" || "$CLEAN_ACTIVE_CHATS" == "true" || "$
     vlog "Fetching chats page ${PAGE}: GET ${URL}"
 
     RESP_FILE=$(mktemp)
-    HTTP_STATUS=$(curl -sS -w "%{http_code}" -o "$RESP_FILE" \
-      --request GET --url "$URL" -u "${API_KEY}:") || {
-        log "ERROR: Network failure on GET /v1/agents"
-        rm -f "$RESP_FILE"
-        exit 1
-      }
+    CURL_EXIT=0
+    HTTP_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$RESP_FILE" \
+      --request GET --url "$URL" -u "${API_KEY}:") || CURL_EXIT=$?
+
+    if [[ "$CURL_EXIT" -ne 0 ]]; then
+      explain_curl_error "$CURL_EXIT" "$URL"
+      rm -f "$RESP_FILE"
+      exit 1
+    fi
 
     if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
-      log "ERROR: GET /v1/agents failed (HTTP $HTTP_STATUS): $(cat "$RESP_FILE")"
+      explain_http_error "$HTTP_STATUS" "Listing Cloud Agent chats (GET /v1/agents)" "$RESP_FILE"
+      rm -f "$RESP_FILE"
+      exit 1
+    fi
+
+    if ! validate_json_file "$RESP_FILE" "Listing Cloud Agent chats (GET /v1/agents)"; then
       rm -f "$RESP_FILE"
       exit 1
     fi
@@ -179,7 +299,6 @@ if [[ "$CLEAN_ARCHIVED_CHATS" == "true" || "$CLEAN_ACTIVE_CHATS" == "true" || "$
   ARCHIVED_TOTAL=$(echo "$ALL_CHATS_JSON" | jq '[.[] | select(.status == "ARCHIVED")] | length')
   ACTIVE_TOTAL=$((CHATS_FOUND - ARCHIVED_TOTAL))
 
-  # Filter chats based on switches
   TARGET_CHATS_JSON=$(echo "$ALL_CHATS_JSON" | jq -c \
     --arg archive "$CLEAN_ARCHIVED_CHATS" \
     --arg active "$CLEAN_ACTIVE_CHATS" '
@@ -205,13 +324,12 @@ if [[ "$CLEAN_ARCHIVED_CHATS" == "true" || "$CLEAN_ACTIVE_CHATS" == "true" || "$
       log "  - Chat ${id} | status=${status} | archived=${archived} | ${name}"
       vlog "    [${INDEX}/${CHATS_TARGETED}] createdAt=${created_at}, latestRunId=${latest_run}"
 
-      # Inspect or export chat run history & conversation messages when requested or in verbose mode
       if [[ "$CLEAN_CHAT_HISTORY" == "true" || "$VERBOSE" == "true" || "$EXPORT_HISTORY" == "true" ]]; then
         RUNS_FILE=$(mktemp)
-        RUNS_STATUS=$(curl -sS -w "%{http_code}" -o "$RUNS_FILE" \
+        RUNS_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$RUNS_FILE" \
           --request GET --url "${BASE_URL}/v1/agents/${id}/runs?limit=100" -u "${API_KEY}:") || RUNS_STATUS="000"
 
-        if [[ "$RUNS_STATUS" -ge 200 && "$RUNS_STATUS" -lt 300 ]]; then
+        if [[ "$RUNS_STATUS" -ge 200 && "$RUNS_STATUS" -lt 300 ]] && jq -e . "$RUNS_FILE" >/dev/null 2>&1; then
           RUN_COUNT=$(jq '.items // [] | length' "$RUNS_FILE")
           HISTORY_RUNS_TOTAL=$((HISTORY_RUNS_TOTAL + RUN_COUNT))
           vlog "    [${INDEX}/${CHATS_TARGETED}] Chat history has ${RUN_COUNT} run(s)"
@@ -219,15 +337,16 @@ if [[ "$CLEAN_ARCHIVED_CHATS" == "true" || "$CLEAN_ACTIVE_CHATS" == "true" || "$
           if [[ "$EXPORT_HISTORY" == "true" ]]; then
             cp "$RUNS_FILE" "${HISTORY_EXPORT_DIR}/${id}_runs.json"
           fi
+        else
+          vlog "    [${INDEX}/${CHATS_TARGETED}] Warning: Could not read run history for ${id} (HTTP ${RUNS_STATUS})"
         fi
         rm -f "$RUNS_FILE"
 
-        # Fetch v0 conversation transcript if exporting history or verbose
         if [[ "$EXPORT_HISTORY" == "true" || "$VERBOSE" == "true" ]]; then
           CONV_FILE=$(mktemp)
-          CONV_STATUS=$(curl -sS -w "%{http_code}" -o "$CONV_FILE" \
+          CONV_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$CONV_FILE" \
             --request GET --url "${BASE_URL}/v0/agents/${id}/conversation" -u "${API_KEY}:") || CONV_STATUS="000"
-          if [[ "$CONV_STATUS" -ge 200 && "$CONV_STATUS" -lt 300 ]]; then
+          if [[ "$CONV_STATUS" -ge 200 && "$CONV_STATUS" -lt 300 ]] && jq -e . "$CONV_FILE" >/dev/null 2>&1; then
             MSG_COUNT=$(jq '.messages // [] | length' "$CONV_FILE" 2>/dev/null || echo 0)
             vlog "    [${INDEX}/${CHATS_TARGETED}] Conversation transcript messages: ${MSG_COUNT}"
             if [[ "$EXPORT_HISTORY" == "true" ]]; then
@@ -238,7 +357,6 @@ if [[ "$CLEAN_ARCHIVED_CHATS" == "true" || "$CLEAN_ACTIVE_CHATS" == "true" || "$
         fi
       fi
 
-      # Perform cancellation of active run + permanent deletion of chat & its history
       if [[ "$DRY_RUN" == "true" ]]; then
         vlog "    [${INDEX}/${CHATS_TARGETED}] Dry-run: would delete chat ${id} and its history"
         continue
@@ -247,29 +365,35 @@ if [[ "$CLEAN_ARCHIVED_CHATS" == "true" || "$CLEAN_ACTIVE_CHATS" == "true" || "$
       if [[ "$status" == "ACTIVE" && -n "$latest_run" && "$latest_run" != "none" ]]; then
         vlog "    [${INDEX}/${CHATS_TARGETED}] Cancelling active run ${latest_run} on chat ${id}..."
         CANCEL_FILE=$(mktemp)
-        CANCEL_STATUS=$(curl -sS -w "%{http_code}" -o "$CANCEL_FILE" \
+        CANCEL_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$CANCEL_FILE" \
           --request POST --url "${BASE_URL}/v1/agents/${id}/runs/${latest_run}/cancel" -u "${API_KEY}:") || CANCEL_STATUS="000"
         rm -f "$CANCEL_FILE"
         if [[ "$CANCEL_STATUS" -ge 200 && "$CANCEL_STATUS" -lt 300 ]]; then
           RUNS_CANCELLED=$((RUNS_CANCELLED + 1))
           vlog "    [${INDEX}/${CHATS_TARGETED}] Cancelled active run ${latest_run} (HTTP ${CANCEL_STATUS})"
+        else
+          vlog "    [${INDEX}/${CHATS_TARGETED}] Note: Run ${latest_run} cancel returned HTTP ${CANCEL_STATUS} (proceeding with delete)"
         fi
       fi
 
+      DELETE_CHAT_URL="${BASE_URL}/v1/agents/${id}"
       DEL_FILE=$(mktemp)
-      DEL_STATUS=$(curl -sS -w "%{http_code}" -o "$DEL_FILE" \
-        --request DELETE --url "${BASE_URL}/v1/agents/${id}" -u "${API_KEY}:") || DEL_STATUS="000"
-      DEL_BODY=$(cat "$DEL_FILE" 2>/dev/null || true)
-      rm -f "$DEL_FILE"
+      DEL_CURL_EXIT=0
+      DEL_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$DEL_FILE" \
+        --request DELETE --url "$DELETE_CHAT_URL" -u "${API_KEY}:") || DEL_CURL_EXIT=$?
 
-      if [[ "$DEL_STATUS" -ge 200 && "$DEL_STATUS" -lt 300 ]]; then
+      if [[ "$DEL_CURL_EXIT" -ne 0 ]]; then
+        CHATS_FAILED=$((CHATS_FAILED + 1))
+        explain_curl_error "$DEL_CURL_EXIT" "$DELETE_CHAT_URL"
+      elif [[ "$DEL_STATUS" -ge 200 && "$DEL_STATUS" -lt 300 ]]; then
         CHATS_DELETED=$((CHATS_DELETED + 1))
         log "    Deleted chat ${id}"
         vlog "    [${INDEX}/${CHATS_TARGETED}] Confirmed DELETE /v1/agents/${id} (HTTP ${DEL_STATUS})"
       else
         CHATS_FAILED=$((CHATS_FAILED + 1))
-        log "    FAILED chat ${id} (HTTP ${DEL_STATUS}): ${DEL_BODY}"
+        explain_http_error "$DEL_STATUS" "Deleting chat '${id}' (${name})" "$DEL_FILE"
       fi
+      rm -f "$DEL_FILE"
     done < <(
       echo "$TARGET_CHATS_JSON" | jq -r '.[] | [
         .id,
@@ -298,15 +422,23 @@ if [[ "$CLEAN_ENVIRONMENTS" == "true" ]]; then
     vlog "Fetching environments page ${PAGE}: GET ${URL}"
 
     RESP_FILE=$(mktemp)
-    HTTP_STATUS=$(curl -sS -w "%{http_code}" -o "$RESP_FILE" \
-      --request GET --url "$URL" -u "${API_KEY}:") || {
-        log "ERROR: Network failure on GET /v1/environments"
-        rm -f "$RESP_FILE"
-        exit 1
-      }
+    CURL_EXIT=0
+    HTTP_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$RESP_FILE" \
+      --request GET --url "$URL" -u "${API_KEY}:") || CURL_EXIT=$?
+
+    if [[ "$CURL_EXIT" -ne 0 ]]; then
+      explain_curl_error "$CURL_EXIT" "$URL"
+      rm -f "$RESP_FILE"
+      exit 1
+    fi
 
     if [[ "$HTTP_STATUS" -lt 200 || "$HTTP_STATUS" -ge 300 ]]; then
-      log "ERROR: GET /v1/environments failed (HTTP $HTTP_STATUS): $(cat "$RESP_FILE")"
+      explain_http_error "$HTTP_STATUS" "Listing Cloud Agent environments (GET /v1/environments)" "$RESP_FILE"
+      rm -f "$RESP_FILE"
+      exit 1
+    fi
+
+    if ! validate_json_file "$RESP_FILE" "Listing Cloud Agent environments (GET /v1/environments)"; then
       rm -f "$RESP_FILE"
       exit 1
     fi
@@ -333,9 +465,9 @@ if [[ "$CLEAN_ENVIRONMENTS" == "true" ]]; then
 
       if [[ "$VERBOSE" == "true" ]]; then
         HIST_FILE=$(mktemp)
-        HIST_STATUS=$(curl -sS -w "%{http_code}" -o "$HIST_FILE" \
+        HIST_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$HIST_FILE" \
           --request GET --url "${BASE_URL}/v1/environments/${env_id}/history?limit=100" -u "${API_KEY}:") || HIST_STATUS="000"
-        if [[ "$HIST_STATUS" -ge 200 && "$HIST_STATUS" -lt 300 ]]; then
+        if [[ "$HIST_STATUS" -ge 200 && "$HIST_STATUS" -lt 300 ]] && jq -e . "$HIST_FILE" >/dev/null 2>&1; then
           HIST_COUNT=$(jq '.items // [] | length' "$HIST_FILE")
           ENV_HISTORY_EVENTS_TOTAL=$((ENV_HISTORY_EVENTS_TOTAL + HIST_COUNT))
           vlog "    [${INDEX}/${ENVS_FOUND}] Environment history events: ${HIST_COUNT}"
@@ -348,20 +480,24 @@ if [[ "$CLEAN_ENVIRONMENTS" == "true" ]]; then
         continue
       fi
 
+      DELETE_ENV_URL="${BASE_URL}/v1/environments/${env_id}"
       DEL_FILE=$(mktemp)
-      DEL_STATUS=$(curl -sS -w "%{http_code}" -o "$DEL_FILE" \
-        --request DELETE --url "${BASE_URL}/v1/environments/${env_id}" -u "${API_KEY}:") || DEL_STATUS="000"
-      DEL_BODY=$(cat "$DEL_FILE" 2>/dev/null || true)
-      rm -f "$DEL_FILE"
+      DEL_CURL_EXIT=0
+      DEL_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$DEL_FILE" \
+        --request DELETE --url "$DELETE_ENV_URL" -u "${API_KEY}:") || DEL_CURL_EXIT=$?
 
-      if [[ "$DEL_STATUS" -ge 200 && "$DEL_STATUS" -lt 300 ]]; then
+      if [[ "$DEL_CURL_EXIT" -ne 0 ]]; then
+        ENVS_FAILED=$((ENVS_FAILED + 1))
+        explain_curl_error "$DEL_CURL_EXIT" "$DELETE_ENV_URL"
+      elif [[ "$DEL_STATUS" -ge 200 && "$DEL_STATUS" -lt 300 ]]; then
         ENVS_DELETED=$((ENVS_DELETED + 1))
         log "    Deleted environment ${env_id}"
         vlog "    [${INDEX}/${ENVS_FOUND}] Confirmed DELETE /v1/environments/${env_id} (HTTP ${DEL_STATUS})"
       else
         ENVS_FAILED=$((ENVS_FAILED + 1))
-        log "    FAILED environment ${env_id} (HTTP ${DEL_STATUS}): ${DEL_BODY}"
+        explain_http_error "$DEL_STATUS" "Deleting environment '${env_id}' (${env_name})" "$DEL_FILE"
       fi
+      rm -f "$DEL_FILE"
     done < <(
       echo "$ALL_ENVS_JSON" | jq -r '.[] | [
         .id,
@@ -377,6 +513,10 @@ fi
 # ==============================================================================
 # Final Summary Log
 # ==============================================================================
-log "Done: chats_deleted=${CHATS_DELETED}/${CHATS_TARGETED} (runs_cancelled=${RUNS_CANCELLED}, history_runs=${HISTORY_RUNS_TOTAL}), envs_deleted=${ENVS_DELETED}/${ENVS_FOUND}, failed=$((CHATS_FAILED + ENVS_FAILED)) | log=${LOG_FILE#$SCRIPT_DIR/}"
+TOTAL_FAILED=$((CHATS_FAILED + ENVS_FAILED))
+log "Done: chats_deleted=${CHATS_DELETED}/${CHATS_TARGETED} (runs_cancelled=${RUNS_CANCELLED}, history_runs=${HISTORY_RUNS_TOTAL}), envs_deleted=${ENVS_DELETED}/${ENVS_FOUND}, failed=${TOTAL_FAILED} | log=${LOG_FILE#$SCRIPT_DIR/}"
 
-[[ $((CHATS_FAILED + ENVS_FAILED)) -eq 0 ]]
+if [[ "$TOTAL_FAILED" -gt 0 ]]; then
+  log_err "Housekeeping completed with ${TOTAL_FAILED} failure(s). Review error details and hints above."
+  exit 1
+fi
