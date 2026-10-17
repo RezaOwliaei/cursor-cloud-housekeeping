@@ -38,12 +38,15 @@ usage() {
 Usage: CURSOR_API_KEY=<key> $0 [TARGET SWITCHES] [OPTIONS]
 
 Target Switches (select one or more):
+  --all-agents, --agents         Delete all Cloud Agents (synonym for --all-chats)
+  --archived-agents              Delete only archived Cloud Agents (synonym for --archived-chats)
+  --active-agents                Delete only active/idle Cloud Agents (synonym for --active-chats)
+  --all-chats, --chats           Delete both archived and active/idle Cloud Agent chats
   --archived-chats, --archived   Delete only archived Cloud Agent chats (status=ARCHIVED)
   --active-chats, --active       Delete only active/idle (non-archived) Cloud Agent chats
-  --all-chats, --chats           Delete both archived and active/idle Cloud Agent chats
   --chat-history, --history      Inspect & purge chat run/conversation history (cancels active runs)
   --environments, --envs         Delete all saved Cloud Agent environments & their history
-  -a, --all                      Clean up everything (all chats, chat history, and environments)
+  -a, --all                      Clean up everything (all agents/chats, chat history, and environments)
 
 Options:
   --export-history               Export conversation & run history JSON to logs/ before deleting
@@ -185,24 +188,24 @@ fi
 
 for arg in "$@"; do
   case "$arg" in
-    --archived-chats|--archived) CLEAN_ARCHIVED_CHATS=true ;;
-    --active-chats|--active)     CLEAN_ACTIVE_CHATS=true ;;
-    --all-chats|--chats)         CLEAN_ARCHIVED_CHATS=true; CLEAN_ACTIVE_CHATS=true ;;
-    --chat-history|--history)    CLEAN_CHAT_HISTORY=true ;;
-    --environments|--envs)       CLEAN_ENVIRONMENTS=true ;;
+    --archived-chats|--archived|--archived-agents) CLEAN_ARCHIVED_CHATS=true ;;
+    --active-chats|--active|--active-agents)       CLEAN_ACTIVE_CHATS=true ;;
+    --all-chats|--chats|--all-agents|--agents)    CLEAN_ARCHIVED_CHATS=true; CLEAN_ACTIVE_CHATS=true ;;
+    --chat-history|--history)                     CLEAN_CHAT_HISTORY=true ;;
+    --environments|--envs)                        CLEAN_ENVIRONMENTS=true ;;
     --all|-a)
       CLEAN_ARCHIVED_CHATS=true
       CLEAN_ACTIVE_CHATS=true
       CLEAN_CHAT_HISTORY=true
       CLEAN_ENVIRONMENTS=true
       ;;
-    --export-history)            EXPORT_HISTORY=true ;;
-    --verbose|--verbous|-v)      VERBOSE=true ;;
-    --dry-run|-n)                DRY_RUN=true ;;
-    --help|-h)                   usage; exit 0 ;;
+    --export-history)                             EXPORT_HISTORY=true ;;
+    --verbose|--verbous|-v)                       VERBOSE=true ;;
+    --dry-run|-n)                                 DRY_RUN=true ;;
+    --help|-h)                                    usage; exit 0 ;;
     *)
       log_err "Unknown option or switch '${arg}'."
-      log_hint "Valid switches: --archived-chats, --active-chats, --all-chats, --chat-history, --environments, --all, --export-history, --verbose, --dry-run."
+      log_hint "Valid switches: --all-agents, --archived-agents, --active-agents, --all-chats, --archived-chats, --active-chats, --chat-history, --environments, --all, --export-history, --verbose, --dry-run."
       exit 1
       ;;
   esac
@@ -323,6 +326,20 @@ if [[ "$CLEAN_ARCHIVED_CHATS" == "true" || "$CLEAN_ACTIVE_CHATS" == "true" || "$
       INDEX=$((INDEX + 1))
       log "  - Chat ${id} | status=${status} | archived=${archived} | ${name}"
       vlog "    [${INDEX}/${CHATS_TARGETED}] createdAt=${created_at}, latestRunId=${latest_run}"
+
+      if [[ "$VERBOSE" == "true" ]]; then
+        DETAIL_FILE=$(mktemp)
+        DETAIL_STATUS=$(curl -sS --max-time "$CURL_TIMEOUT" -w "%{http_code}" -o "$DETAIL_FILE" \
+          --request GET --url "${BASE_URL}/v1/agents/${id}" -u "${API_KEY}:") || DETAIL_STATUS="000"
+        if [[ "$DETAIL_STATUS" -ge 200 && "$DETAIL_STATUS" -lt 300 ]] && jq -e . "$DETAIL_FILE" >/dev/null 2>&1; then
+          REPOS_INFO=$(jq -r '(.repos // []) | map("\(.url) (ref: \(.startingRef // "default"))") | join(", ")' "$DETAIL_FILE")
+          AUTO_PR=$(jq -r '.autoCreatePR // false' "$DETAIL_FILE")
+          WORK_BRANCH=$(jq -r '.workOnCurrentBranch // false' "$DETAIL_FILE")
+          vlog "      Repositories : ${REPOS_INFO:-none}"
+          vlog "      Options      : autoCreatePR=${AUTO_PR}, workOnCurrentBranch=${WORK_BRANCH}"
+        fi
+        rm -f "$DETAIL_FILE"
+      fi
 
       if [[ "$CLEAN_CHAT_HISTORY" == "true" || "$VERBOSE" == "true" || "$EXPORT_HISTORY" == "true" ]]; then
         RUNS_FILE=$(mktemp)
