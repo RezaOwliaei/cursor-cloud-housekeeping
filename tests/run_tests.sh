@@ -115,9 +115,9 @@ REMAINING=$(curl -sS "${CURSOR_API_BASE_URL}/v1/agents" | jq '.items | length')
 echo "PASS [7/15]: housekeeping.sh --all-agents --verbous listed and deleted all 3 agents."
 echo ""
 
-================================================================================
-PART B: ERROR HANDLING & DIAGNOSTIC HINT TESTS (Tests 8 - 15)
-================================================================================
+echo "================================================================================"
+echo "PART B: ERROR HANDLING & DIAGNOSTIC HINT TESTS (Tests 8 - 15)"
+echo "================================================================================"
 
 echo "--- TEST 8: Missing CURSOR_API_KEY ---"
 CURSOR_API_KEY="" assert_fails_with "Environment variable CURSOR_API_KEY is missing or empty." ./housekeeping.sh --all
@@ -161,6 +161,6 @@ CURSOR_API_BASE_URL="http://127.0.0.1:19999" assert_fails_with "Failed to connec
 echo "PASS [15/15]: Partial HTTP 403 deletion failure and curl exit 7 connection refused handled with clear diagnostics."
 echo ""
 
-================================================================================
-ALL 15/15 DOCKER CONTAINER TESTS PASSED (7 Functional + 8 Error Handling)!
-================================================================================
+echo "================================================================================"
+echo "ALL 15/15 DOCKER CONTAINER TESTS PASSED (7 Functional + 8 Error Handling)!"
+echo "================================================================================"
